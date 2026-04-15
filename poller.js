@@ -11,6 +11,17 @@
 
 'use strict'
 
+// Load .env file if present (works with PM2 which doesn't auto-load .env)
+const fs = require('fs')
+const path = require('path')
+const envPath = path.join(__dirname, '.env')
+if (fs.existsSync(envPath)) {
+  for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+    const match = line.match(/^([^#=]+)=(.*)$/)
+    if (match) process.env[match[1].trim()] = match[2].trim()
+  }
+}
+
 const SUPABASE_URL   = process.env.SUPABASE_URL   // e.g. https://ilpfknjpfmgvzjafqtls.supabase.co
 const POLLER_SECRET  = process.env.POLLER_SECRET   // shared secret set in Supabase Edge Function secrets
 
