@@ -1,0 +1,17 @@
+{
+  "name": "fleet-poller",
+  "version": "1.0.0",
+  "description": "VPS background poller — calls Supabase Edge Functions on a fixed interval",
+  "main": "poller.js",
+  "scripts": {
+    "start": "node poller.js",
+    "start:pm2": "pm2 start poller.js --name fleet-poller --restart-delay 3000 --max-restarts 10"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "keywords": [],
+  "license": "UNLICENSED",
+  "private": true
+}
