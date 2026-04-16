@@ -28,20 +28,39 @@ const POLLER_SECRET  = process.env.POLLER_SECRET   // shared secret set in Supab
 if (!SUPABASE_URL)  throw new Error('Missing env: SUPABASE_URL')
 if (!POLLER_SECRET) throw new Error('Missing env: POLLER_SECRET')
 
+// ── Day/night schedule ─────────────────────────────────────────────────────
+// During school hours (05:00–18:00 UK time) poll every 5s.
+// Overnight poll every 15 minutes — vehicles are parked, no need to hammer Samsara.
+const DAY_INTERVAL_MS   =      5_000   //  5 seconds
+const NIGHT_INTERVAL_MS = 15 * 60_000  // 15 minutes
+
+function isUkDayTime() {
+  // Get current hour in Europe/London (handles GMT/BST automatically)
+  const londonHour = new Date().toLocaleString('en-GB', {
+    timeZone: 'Europe/London',
+    hour:     'numeric',
+    hour12:   false,
+  })
+  const h = parseInt(londonHour, 10)
+  return h >= 5 && h < 18  // 05:00 – 17:59 UK time
+}
+
+function currentInterval() {
+  return isUkDayTime() ? DAY_INTERVAL_MS : NIGHT_INTERVAL_MS
+}
+
 // ── Job definitions ────────────────────────────────────────────────────────
 // Each job calls a Supabase Edge Function via HTTP POST.
-// intervalMs: how often to call it (minimum ~1000ms in practice)
 const JOBS = [
   {
-    name:        'samsara-location',
-    path:        '/functions/v1/samsara-location-webhook',
-    intervalMs:  5_000,   // every 5 seconds
+    name: 'samsara-location',
+    path: '/functions/v1/samsara-location-webhook',
   },
   // Add more jobs here as needed, e.g.:
   // {
-  //   name:       'cert-expiry-reminders',
-  //   path:       '/functions/v1/cert-expiry-reminders',
-  //   intervalMs: 60 * 60 * 1000,  // every hour
+  //   name: 'cert-expiry-reminders',
+  //   path: '/functions/v1/cert-expiry-reminders',
+  //   fixedIntervalMs: 60 * 60 * 1000,  // fixed interval, ignores day/night
   // },
 ]
 
@@ -60,20 +79,28 @@ async function callJob(job) {
     if (!res.ok) {
       console.error(`[${job.name}] HTTP ${res.status}: ${text}`)
     } else {
-      console.log(`[${job.name}] OK ${res.status} — ${new Date().toISOString()}`)
+      const interval = job.fixedIntervalMs ?? currentInterval()
+      console.log(`[${job.name}] OK ${res.status} — ${new Date().toISOString()} — next in ${interval / 1000}s`)
     }
   } catch (err) {
-    // Network error — log and continue. PM2 will restart the process if it crashes.
     console.error(`[${job.name}] fetch error: ${err.message}`)
   }
 }
 
-// ── Schedule all jobs ──────────────────────────────────────────────────────
-for (const job of JOBS) {
-  // Fire immediately on startup, then on interval
-  void callJob(job)
-  setInterval(() => void callJob(job), job.intervalMs)
-  console.log(`[fleet-poller] scheduled: ${job.name} every ${job.intervalMs / 1000}s`)
+// ── Dynamic scheduling (respects day/night interval changes) ───────────────
+function scheduleJob(job) {
+  const interval = job.fixedIntervalMs ?? currentInterval()
+  setTimeout(async () => {
+    await callJob(job)
+    scheduleJob(job)  // reschedule after each run so interval can change
+  }, interval)
 }
 
-console.log(`[fleet-poller] running — ${JOBS.length} job(s) active`)
+// ── Start all jobs ─────────────────────────────────────────────────────────
+for (const job of JOBS) {
+  void callJob(job)   // fire immediately on startup
+  scheduleJob(job)    // then on dynamic interval
+  console.log(`[fleet-poller] scheduled: ${job.name} (day=${DAY_INTERVAL_MS / 1000}s night=${NIGHT_INTERVAL_MS / 60_000}min)`)
+}
+
+console.log(`[fleet-poller] running — ${JOBS.length} job(s) active — UK time: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`)
