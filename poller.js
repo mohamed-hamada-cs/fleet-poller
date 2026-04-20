@@ -56,6 +56,11 @@ const JOBS = [
     name: 'samsara-location',
     path: '/functions/v1/samsara-location-webhook',
   },
+  {
+    name: 'samsara-fuel-snapshot',
+    path: '/functions/v1/samsara-fuel-snapshot',
+    fixedIntervalMs: 15 * 60_000,  // every 15 min regardless of day/night
+  },
   // Add more jobs here as needed, e.g.:
   // {
   //   name: 'cert-expiry-reminders',
