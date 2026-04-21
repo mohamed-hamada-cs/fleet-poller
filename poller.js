@@ -72,6 +72,8 @@ const JOBS = [
 // ── Runner ─────────────────────────────────────────────────────────────────
 async function callJob(job) {
   const url = `${SUPABASE_URL}${job.path}`
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 60_000)  // 60s timeout
   try {
     const res = await fetch(url, {
       method:  'POST',
@@ -79,7 +81,9 @@ async function callJob(job) {
         'Authorization': `Bearer ${POLLER_SECRET}`,
         'Content-Type':  'application/json',
       },
+      signal: controller.signal,
     })
+    clearTimeout(timeout)
     const text = await res.text()
     if (!res.ok) {
       console.error(`[${job.name}] HTTP ${res.status}: ${text}`)
@@ -88,7 +92,9 @@ async function callJob(job) {
       console.log(`[${job.name}] OK ${res.status} — ${new Date().toISOString()} — next in ${interval / 1000}s`)
     }
   } catch (err) {
-    console.error(`[${job.name}] fetch error: ${err.message}`)
+    clearTimeout(timeout)
+    const msg = err.name === 'AbortError' ? 'timed out after 60s' : err.message
+    console.error(`[${job.name}] fetch error: ${msg}`)
   }
 }
 
