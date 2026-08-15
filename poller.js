@@ -25,28 +25,70 @@ if (fs.existsSync(envPath)) {
 const SUPABASE_URL   = process.env.SUPABASE_URL   // e.g. https://ilpfknjpfmgvzjafqtls.supabase.co
 const POLLER_SECRET  = process.env.POLLER_SECRET   // shared secret set in Supabase Edge Function secrets
 
+// Optional — set only on the environment whose Edge Function points at the simulator (staging).
+// Without them the simulator gate is simply off and this behaves as it always did.
+const SIM_URL        = (process.env.SIM_URL || '').replace(/\/$/, '')
+const SIM_SECRET     = process.env.SIM_CONTROL_SECRET || ''
+
 if (!SUPABASE_URL)  throw new Error('Missing env: SUPABASE_URL')
 if (!POLLER_SECRET) throw new Error('Missing env: POLLER_SECRET')
 
-// ── Day/night schedule ─────────────────────────────────────────────────────
-// During school hours (05:00–18:00 UK time) poll every 5s.
-// Overnight poll every 15 minutes — vehicles are parked, no need to hammer Samsara.
-const DAY_INTERVAL_MS   =      5_000   //  5 seconds
-const NIGHT_INTERVAL_MS = 15 * 60_000  // 15 minutes
+// ── When to poll fast ──────────────────────────────────────────────────────
+// School runs happen on weekday mornings and afternoons, so that window is polled every 5s.
+// Outside it, vans are parked and there is nothing to see — EXCEPT when someone is running a
+// simulated trip, which can be at any hour. So outside the window we ask the simulator (our own
+// VPS, costs nothing) and only spend a Supabase invocation when a simulated vehicle is actually
+// under way. A 15-minute floor stays in place so a real vehicle moving overnight — a theft, a
+// van taken home — still shows up rather than the map freezing until morning.
+const FAST_INTERVAL_MS = 5_000        // 5 seconds
+const FLOOR_INTERVAL_MS = 15 * 60_000 // 15 minutes — the slowest we ever go
+const TICK_MS = FAST_INTERVAL_MS      // how often we DECIDE; deciding is local and free
 
-function isUkDayTime() {
-  // Get current hour in Europe/London (handles GMT/BST automatically)
-  const londonHour = new Date().toLocaleString('en-GB', {
-    timeZone: 'Europe/London',
-    hour:     'numeric',
-    hour12:   false,
+// States that mean a simulated trip is under way. A vehicle sitting paused or finished is a
+// leftover from an earlier test — polling fast for it all night is the waste we are removing.
+const SIM_ACTIVE_STATES = ['driving', 'dwelling', 'waiting', 'breakdown', 'crash']
+
+function ukParts() {
+  // Europe/London handles GMT/BST automatically.
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', hour: 'numeric', hour12: false, weekday: 'short',
   })
-  const h = parseInt(londonHour, 10)
-  return h >= 5 && h < 18  // 05:00 – 17:59 UK time
+  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map((p) => [p.type, p.value]))
+  return { hour: parseInt(parts.hour, 10), weekday: parts.weekday }
 }
 
-function currentInterval() {
-  return isUkDayTime() ? DAY_INTERVAL_MS : NIGHT_INTERVAL_MS
+function isSchoolWindow() {
+  const { hour, weekday } = ukParts()
+  const weekend = weekday === 'Sat' || weekday === 'Sun'
+  return !weekend && hour >= 5 && hour < 18  // 05:00 – 17:59 UK time, Mon–Fri
+}
+
+let simWarned = false
+
+async function simulatorIsBusy() {
+  if (!SIM_URL || !SIM_SECRET) return false
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 3_000)
+  try {
+    const res = await fetch(`${SIM_URL}/sim/vehicles`, {
+      headers: { Authorization: `Bearer ${SIM_SECRET}` },
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const fleet = await res.json()
+    simWarned = false
+    return Array.isArray(fleet) && fleet.some((v) => SIM_ACTIVE_STATES.includes(v.state))
+  } catch (err) {
+    clearTimeout(timeout)
+    // Unreachable simulator means no simulated test is running that we can see. Say so once
+    // rather than every 5 seconds, and fall back to the floor — never to fast polling.
+    if (!simWarned) {
+      console.warn(`[sim-gate] simulator unreachable (${err.message}) — falling back to the ${FLOOR_INTERVAL_MS / 60_000}min floor`)
+      simWarned = true
+    }
+    return false
+  }
 }
 
 // ── Job definitions ────────────────────────────────────────────────────────
@@ -70,7 +112,7 @@ const JOBS = [
 ]
 
 // ── Runner ─────────────────────────────────────────────────────────────────
-async function callJob(job) {
+async function callJob(job, reason = '') {
   const url = `${SUPABASE_URL}${job.path}`
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 60_000)  // 60s timeout
@@ -88,8 +130,7 @@ async function callJob(job) {
     if (!res.ok) {
       console.error(`[${job.name}] HTTP ${res.status}: ${text}`)
     } else {
-      const interval = job.fixedIntervalMs ?? currentInterval()
-      console.log(`[${job.name}] OK ${res.status} — ${new Date().toISOString()} — next in ${interval / 1000}s`)
+      console.log(`[${job.name}] OK ${res.status} — ${new Date().toISOString()}${reason ? ` — ${reason}` : ''}`)
     }
   } catch (err) {
     clearTimeout(timeout)
@@ -98,20 +139,53 @@ async function callJob(job) {
   }
 }
 
-// ── Dynamic scheduling (respects day/night interval changes) ───────────────
-function scheduleJob(job) {
-  const interval = job.fixedIntervalMs ?? currentInterval()
+// ── Fixed-interval jobs ────────────────────────────────────────────────────
+function scheduleFixed(job) {
   setTimeout(async () => {
     await callJob(job)
-    scheduleJob(job)  // reschedule after each run so interval can change
-  }, interval)
+    scheduleFixed(job)
+  }, job.fixedIntervalMs)
+}
+
+// ── Demand-driven job ──────────────────────────────────────────────────────
+// Ticks every 5s and decides each time. Deciding is local, so a simulated trip started at any
+// hour is picked up within one tick instead of waiting out a 15-minute sleep — which is what
+// the old "choose the interval, then sleep it" scheduler did.
+function scheduleDynamic(job) {
+  let lastCallMs = 0
+
+  const tick = async () => {
+    const sinceMs = Date.now() - lastCallMs
+    let reason = ''
+
+    if (isSchoolWindow()) {
+      reason = 'school window'
+    } else if (await simulatorIsBusy()) {
+      reason = 'simulated trip running'
+    } else if (sinceMs >= FLOOR_INTERVAL_MS) {
+      reason = `${FLOOR_INTERVAL_MS / 60_000}min floor`
+    }
+
+    if (reason) {
+      lastCallMs = Date.now()
+      await callJob(job, reason)
+    }
+    setTimeout(tick, TICK_MS)
+  }
+
+  void tick()
 }
 
 // ── Start all jobs ─────────────────────────────────────────────────────────
 for (const job of JOBS) {
-  void callJob(job)   // fire immediately on startup
-  scheduleJob(job)    // then on dynamic interval
-  console.log(`[fleet-poller] scheduled: ${job.name} (day=${DAY_INTERVAL_MS / 1000}s night=${NIGHT_INTERVAL_MS / 60_000}min)`)
+  if (job.fixedIntervalMs) {
+    void callJob(job)
+    scheduleFixed(job)
+    console.log(`[fleet-poller] scheduled: ${job.name} (every ${job.fixedIntervalMs / 60_000}min)`)
+  } else {
+    scheduleDynamic(job)
+    console.log(`[fleet-poller] scheduled: ${job.name} (fast=${FAST_INTERVAL_MS / 1000}s in school window, floor=${FLOOR_INTERVAL_MS / 60_000}min, simulator gate ${SIM_URL ? 'ON' : 'off'})`)
+  }
 }
 
 console.log(`[fleet-poller] running — ${JOBS.length} job(s) active — UK time: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`)
