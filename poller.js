@@ -44,6 +44,13 @@ const FAST_INTERVAL_MS = 5_000        // 5 seconds
 const FLOOR_INTERVAL_MS = 15 * 60_000 // 15 minutes — the slowest we ever go
 const TICK_MS = FAST_INTERVAL_MS      // how often we DECIDE; deciding is local and free
 
+// 20s, not the 60s this used to be. 60s was inherited from when this was a 15-minute job; on a
+// 5-second job a reply that arrives after a minute is worthless, and waiting for it blanked the
+// map for 71 seconds — far enough for a van to drive through a 150m geofence unseen. 20s is
+// chosen from the data: the slowest SUCCESSFUL call ever recorded is 14.2s, so anything shorter
+// would start aborting work that was about to succeed.
+const DEFAULT_TIMEOUT_MS = 20_000
+
 // States that mean a simulated trip is under way. A vehicle sitting paused or finished is a
 // leftover from an earlier test — polling fast for it all night is the waste we are removing.
 const SIM_ACTIVE_STATES = ['driving', 'dwelling', 'waiting', 'breakdown', 'crash']
@@ -115,7 +122,8 @@ const JOBS = [
 async function callJob(job, reason = '') {
   const url = `${SUPABASE_URL}${job.path}`
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 60_000)  // 60s timeout
+  const timeoutMs = job.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(url, {
       method:  'POST',
@@ -134,7 +142,7 @@ async function callJob(job, reason = '') {
     }
   } catch (err) {
     clearTimeout(timeout)
-    const msg = err.name === 'AbortError' ? 'timed out after 60s' : err.message
+    const msg = err.name === 'AbortError' ? `timed out after ${timeoutMs / 1000}s` : err.message
     console.error(`[${job.name}] fetch error: ${msg}`)
   }
 }
@@ -153,8 +161,19 @@ function scheduleFixed(job) {
 // the old "choose the interval, then sleep it" scheduler did.
 function scheduleDynamic(job) {
   let lastCallMs = 0
+  let inFlight = false
 
   const tick = async () => {
+    setTimeout(tick, TICK_MS)   // schedule the NEXT tick first — see note below
+
+    // One call at a time. The tick no longer waits for the call to finish, so a stalled request
+    // costs only the samples it overlaps instead of stopping the clock: the old shape was
+    // "call, await, then sleep 5s", which turned a 20s stall into a 25s gap and made the real
+    // cadence 5s + however long the call took (6.4s staging, 12.1s production — never the 5s
+    // the docs claimed). Skipping rather than queueing means we never build a backlog of
+    // requests against a service that is already struggling.
+    if (inFlight) return
+
     const sinceMs = Date.now() - lastCallMs
     let reason = ''
 
@@ -166,11 +185,15 @@ function scheduleDynamic(job) {
       reason = `${FLOOR_INTERVAL_MS / 60_000}min floor`
     }
 
-    if (reason) {
-      lastCallMs = Date.now()
+    if (!reason) return
+
+    inFlight = true
+    lastCallMs = Date.now()
+    try {
       await callJob(job, reason)
+    } finally {
+      inFlight = false
     }
-    setTimeout(tick, TICK_MS)
   }
 
   void tick()
